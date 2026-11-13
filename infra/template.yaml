@@ -1,0 +1,554 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  DocuSense: serverless document intelligence pipeline with human review.
+  S3 + Lambda + Textract + Comprehend + DynamoDB + Cognito + API Gateway + SNS + SQS + CloudWatch.
+  Deploy it as a separate stack (set a different Suffix from the Console-built resources).
+
+Parameters:
+  Suffix:
+    Type: String
+    Default: sam
+    AllowedPattern: "^[a-z0-9-]{2,12}$"
+    ConstraintDescription: 2 to 12 lowercase letters, digits or hyphens.
+    Description: Added to every resource name so this stack never clashes with another copy.
+  AdminEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: Receives review and alarm emails. You must confirm the subscription from the email.
+  Threshold:
+    Type: Number
+    Default: 80
+    MinValue: 0
+    MaxValue: 100
+    Description: Minimum confidence score (lowest of vendor, date, total) for auto approval.
+  SiteOrigin:
+    Type: String
+    Default: http://localhost:8000
+    AllowedPattern: "^https?://[A-Za-z0-9.:-]+$"
+    ConstraintDescription: An origin such as http://localhost:8000, with no trailing slash.
+    Description: The website origin allowed by API CORS, uploads-bucket CORS and the Cognito callback.
+  TableBillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: >
+      PAY_PER_REQUEST adds no provisioned capacity, so it will not use up the 25 free units that the
+      Console-built tables already use. PROVISIONED uses 5 read and 5 write units per table and per index.
+
+Conditions:
+  IsProvisioned: !Equals [!Ref TableBillingMode, PROVISIONED]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    MemorySize: 256
+
+Resources:
+  # ------------------------------------------------------------------ storage
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub docusense-uploads-${Suffix}-${AWS::AccountId}-${AWS::Region}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: delete-uploads-after-30-days
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: [!Ref SiteOrigin]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub DocuSense-Documents-${Suffix}
+      BillingMode: !Ref TableBillingMode
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: docId, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: docId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: status-createdAt
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - !Ref AWS::NoValue
+
+  AuditLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub DocuSense-AuditLog-${Suffix}
+      BillingMode: !Ref TableBillingMode
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      AttributeDefinitions:
+        - { AttributeName: docId, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: docId, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+
+  # ------------------------------------------------------ notifications / DLQ
+  AdminTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub DocuSense-AdminAlerts-${Suffix}
+
+  AdminSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AdminTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  AdminTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AdminTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AdminTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ProcessorDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub DocuSense-ProcessorDLQ-${Suffix}
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  # ------------------------------------------------------------ sign-in
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub DocuSense-UserPool-${Suffix}
+      UserPoolTier: ESSENTIALS
+      UsernameAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: "OFF"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: DocuSense-WebClient
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub "${SiteOrigin}/"]
+      LogoutURLs: [!Sub "${SiteOrigin}/"]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub docusense-${Suffix}-${AWS::AccountId}
+
+  ReviewersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: reviewers
+      Description: Can review and correct documents
+
+  # ------------------------------------------------------------ API
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+      CorsConfiguration:
+        AllowOrigins: [!Ref SiteOrigin]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, OPTIONS]
+        MaxAge: 300
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+
+  # ------------------------------------------------------------ log groups (7 days)
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/DocuSense-Processor-${Suffix}
+      RetentionInDays: 7
+
+  UploadUrlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/DocuSense-UploadUrl-${Suffix}
+      RetentionInDays: 7
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/DocuSense-Api-${Suffix}
+      RetentionInDays: 7
+
+  # ------------------------------------------------------------ roles (least privilege)
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DocuSense-ProcessorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadUploads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::docusense-uploads-${Suffix}-${AWS::AccountId}-${AWS::Region}/uploads/*
+              - Sid: TextractAnalyzeExpense
+                Effect: Allow
+                Action: textract:AnalyzeExpense
+                Resource: "*"
+              - Sid: ComprehendDetectPii
+                Effect: Allow
+                Action: comprehend:DetectPiiEntities
+                Resource: "*"
+              - Sid: DynamoDBTables
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt DocumentsTable.Arn
+                  - !GetAtt AuditLogTable.Arn
+              - Sid: PublishAdminAlert
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AdminTopic
+              - Sid: SendToDlq
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ProcessorDlq.Arn
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ProcessorLogGroup.Arn
+
+  UploadUrlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DocuSense-UploadUrlPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PresignedPostUpload
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::docusense-uploads-${Suffix}-${AWS::AccountId}-${AWS::Region}/uploads/*
+              - Sid: CreateUploadingRecord
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt DocumentsTable.Arn
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt UploadUrlLogGroup.Arn
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DocuSense-ApiPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadDocuments
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt DocumentsTable.Arn
+                  - !Sub ${DocumentsTable.Arn}/index/status-createdAt
+              - Sid: ReviewDecisions
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt DocumentsTable.Arn
+              - Sid: WriteAudit
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AuditLogTable.Arn
+              - Sid: ViewUploads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::docusense-uploads-${Suffix}-${AWS::AccountId}-${AWS::Region}/uploads/*
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ApiLogGroup.Arn
+
+  # ------------------------------------------------------------ functions
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProcessorLogGroup
+    Properties:
+      FunctionName: !Sub DocuSense-Processor-${Suffix}
+      CodeUri: ../backend/processor/
+      Handler: lambda_function.lambda_handler
+      Timeout: 60
+      Role: !GetAtt ProcessorRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DocumentsTable
+          AUDIT_TABLE: !Ref AuditLogTable
+          SNS_TOPIC_ARN: !Ref AdminTopic
+          THRESHOLD: !Ref Threshold
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt ProcessorDlq.Arn
+      Events:
+        UploadedPdf:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: uploads/ }
+                  - { Name: suffix, Value: .pdf }
+        UploadedPng:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: uploads/ }
+                  - { Name: suffix, Value: .png }
+        UploadedJpg:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: uploads/ }
+                  - { Name: suffix, Value: .jpg }
+        UploadedJpeg:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: uploads/ }
+                  - { Name: suffix, Value: .jpeg }
+
+  UploadUrlFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: UploadUrlLogGroup
+    Properties:
+      FunctionName: !Sub DocuSense-UploadUrl-${Suffix}
+      CodeUri: ../backend/upload_url/
+      Handler: lambda_function.lambda_handler
+      Timeout: 10
+      Role: !GetAtt UploadUrlRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub docusense-uploads-${Suffix}-${AWS::AccountId}-${AWS::Region}
+          TABLE_NAME: !Ref DocumentsTable
+      Events:
+        UploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /upload-url
+            Method: POST
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiLogGroup
+    Properties:
+      FunctionName: !Sub DocuSense-Api-${Suffix}
+      CodeUri: ../backend/api/
+      Handler: lambda_function.lambda_handler
+      Timeout: 10
+      Role: !GetAtt ApiRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub docusense-uploads-${Suffix}-${AWS::AccountId}-${AWS::Region}
+          TABLE_NAME: !Ref DocumentsTable
+          AUDIT_TABLE: !Ref AuditLogTable
+      Events:
+        ListDocuments:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /documents
+            Method: GET
+        GetDocument:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /documents/{id}
+            Method: GET
+        ReviewPending:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /review/pending
+            Method: GET
+        ReviewDecision:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /review/{id}
+            Method: POST
+
+  # ------------------------------------------------------------ alarms
+  DlqMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub DocuSense-DLQ-Messages-${Suffix}
+      AlarmDescription: A failed event is waiting in the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessorDlq.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AdminTopic]
+
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub DocuSense-Processor-Errors-${Suffix}
+      AlarmDescription: The processor Lambda reported an error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AdminTopic]
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the HTTP API (use it as API_BASE in api.js).
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Use it as clientId in auth.js.
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Description: Use it as cognitoDomain in auth.js.
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  UploadsBucketName:
+    Value: !Ref UploadsBucket
+  DocumentsTableName:
+    Value: !Ref DocumentsTable
+  AuditLogTableName:
+    Value: !Ref AuditLogTable
+  AdminTopicArn:
+    Value: !Ref AdminTopic
+  ProcessorDlqUrl:
+    Value: !Ref ProcessorDlq

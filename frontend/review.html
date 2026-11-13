@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DocuSense | Review queue</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="app.html">DocuSense</a>
+    <div class="topbar-right">
+      <a class="nav-link" href="app.html">My documents</a>
+      <span id="user-email" class="user-email"></span>
+      <button id="logout-btn" class="btn btn-secondary" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main class="container container-wide">
+    <section id="not-reviewer" class="card" hidden>
+      <h2>Reviewers only</h2>
+      <p class="hint">This page is for members of the reviewers group. You can still upload and track your own documents.</p>
+      <a class="btn btn-primary btn-link" href="app.html">Back to my documents</a>
+    </section>
+
+    <div id="review-area" class="review-layout" hidden>
+      <section class="card" aria-labelledby="queue-title">
+        <div class="card-head">
+          <h2 id="queue-title">Waiting for review</h2>
+          <button id="queue-refresh-btn" class="btn btn-secondary" type="button">Refresh</button>
+        </div>
+        <p id="queue-message" class="message" role="status" aria-live="polite"></p>
+        <ul id="queue-list" class="queue"></ul>
+      </section>
+
+      <section id="detail-card" class="card" aria-labelledby="detail-title" hidden>
+        <h2 id="detail-title">Review document</h2>
+        <p id="detail-subtitle" class="hint"></p>
+
+        <div id="preview" class="preview"></div>
+        <p class="hint">Preview links expire after 5 minutes. Press Refresh to renew them.</p>
+
+        <form id="review-form" class="review-form" novalidate>
+          <div id="fields-wrap"></div>
+          <p id="pii-line" class="hint"></p>
+          <p class="hint">Changed fields are saved as a correction.</p>
+
+          <div class="field">
+            <label for="reject-reason">Rejection reason (optional)</label>
+            <input id="reject-reason" type="text" maxlength="200" autocomplete="off">
+          </div>
+
+          <div class="actions">
+            <button id="approve-btn" class="btn btn-primary" type="button">Approve</button>
+            <button id="reject-btn" class="btn btn-danger" type="button">Reject</button>
+          </div>
+        </form>
+        <p id="detail-message" class="message" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+  </main>
+
+  <script src="auth.js"></script>
+  <script src="api.js"></script>
+  <script src="review.js"></script>
+</body>
+</html>
